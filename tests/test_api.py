@@ -886,13 +886,14 @@ def test_heat_exposure_last_microsecond_of_huge_span_keeps_boundary_offset(clien
     # maximum finite floats, T one representable step below the max. The
     # query window is the LAST MICROSECOND of the segment: its start sits
     # at fraction 1 - 1e-17 of the span, which rounds to exactly 1.0 in
-    # float64, so a boundary temperature interpolated from t0 (or any
-    # "1 - f" form) snaps to the +max endpoint and the sliver is misread
-    # as a constant-max segment (area = one full endpoint ulp above T,
-    # ~1.9958403095e286). Interpolating from the nearer endpoint keeps
-    # the microsecond offset: the true boundary temperature is
-    # -max + 2*max*(1 - 1e-17), and the trapezoid over the microsecond is
-    # ~1.8160709960e286.
+    # float64, so a boundary temperature interpolated as a float64
+    # fraction of the span (from either endpoint, or any "1 - f" form)
+    # snaps to the +max endpoint and the sliver is misread as a
+    # constant-max segment (area = one full endpoint ulp above T,
+    # ~1.9958403095e286). Exact rational interpolation from the integer
+    # microsecond offset keeps the offset: the true boundary temperature
+    # is -max + 2*max*(1 - 1e-17), and the trapezoid over the microsecond
+    # is ~1.8160709960e286.
     max_float = sys.float_info.max
     baseline = math.nextafter(max_float, 0.0)
     set_thresholds(client)
@@ -928,6 +929,84 @@ def test_heat_exposure_last_microsecond_of_huge_span_keeps_boundary_offset(clien
     )
     assert resp.status_code == 200
     body = resp.json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.0
+    assert body["excess_degree_seconds"] == 0.0
+
+
+def test_heat_exposure_mid_span_microsecond_window_keeps_crossing(client):
+    # Same M = 1e11 s segment as above (2026-01-01T00:00:00Z negative max
+    # finite float -> 5194-11-16T09:46:40Z positive max finite float,
+    # T = 0), but the query window is the single microsecond starting at
+    # the segment MIDPOINT (3610-06-09T16:53:20Z), exactly where the ramp
+    # crosses T. The window's offsets from both endpoints are ~5e16 of
+    # 1e17 microseconds, so every float64 fraction-of-span form rounds
+    # them to exactly 0.5 and both boundary heights collapse to the
+    # midpoint height 0.0: the window's genuine above-T sliver and its
+    # area cancelled out (midpoint cancellation). Exact rational boundary
+    # interpolation keeps the microsecond offset: the window start sits
+    # exactly on T and the window end a sliver above it, so the whole
+    # microsecond counts with a triangle area of max_float * 1e-23
+    # degree-seconds.
+    max_float = sys.float_info.max
+    set_thresholds(client)
+    set_sampling(client, max_interval=100000000000, grace=0)
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", -max_float),
+            ("5194-11-16T09:46:40+00:00", max_float),
+        ],
+    )
+    resp = get_heat(
+        client,
+        "3610-06-09T16:53:20+00:00",
+        "3610-06-09T16:53:20.000001+00:00",
+        0.0,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.000001
+    assert body["excess_degree_seconds"] == pytest.approx(1.7976931349e285, rel=1e-9)
+
+    # The microsecond just BEFORE the midpoint is entirely below T.
+    body = get_heat(
+        client,
+        "3610-06-09T16:53:19.999999+00:00",
+        "3610-06-09T16:53:20+00:00",
+        0.0,
+    ).json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.0
+    assert body["excess_degree_seconds"] == 0.0
+
+    # The descending ramp is handled by the same rule: mirrored across
+    # the midpoint, the microsecond just before it is entirely above T
+    # with the same area, and the one starting at it is entirely below.
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", max_float),
+            ("5194-11-16T09:46:40+00:00", -max_float),
+        ],
+    )
+    body = get_heat(
+        client,
+        "3610-06-09T16:53:19.999999+00:00",
+        "3610-06-09T16:53:20+00:00",
+        0.0,
+    ).json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.000001
+    assert body["excess_degree_seconds"] == pytest.approx(1.7976931349e285, rel=1e-9)
+
+    body = get_heat(
+        client,
+        "3610-06-09T16:53:20+00:00",
+        "3610-06-09T16:53:20.000001+00:00",
+        0.0,
+    ).json()
     assert body["covered_seconds"] == 0.000001
     assert body["above_seconds"] == 0.0
     assert body["excess_degree_seconds"] == 0.0

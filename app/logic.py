@@ -18,6 +18,7 @@ from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from statistics import median
 from typing import Iterable, List, Optional, Tuple
 
@@ -357,17 +358,28 @@ def _segment_above(
         subnormal, at T = 0) interpolate instead of dividing by zero.
 
     The clip-boundary heights are affine interpolations of the scaled
-    endpoint excess heights a0/a1, evaluated from the *nearer* endpoint:
-    a boundary one microsecond before t1 over a 1e11-second span sits at
-    fraction 1 - 1e-17 from t0, which rounds to exactly 1.0 in float64,
-    so a "from t0" evaluation (or any 1 - f form) loses the offset and
-    misreads the boundary temperature by a whole endpoint ulp. Taking the
-    fraction from the nearer endpoint keeps the microsecond offset as a
-    tiny but nonzero fraction of the span, so the boundary height keeps
-    its proper value between the baseline-adjacent floats (e.g. T one ulp
-    below sys.float_info.max) and the area of a microsecond-wide window
-    at the segment's end stays the true trapezoid instead of a
-    constant-endpoint rectangle.
+    endpoint excess heights a0/a1, computed in *exact rational
+    arithmetic* from the integer microsecond offset and correctly
+    rounded to float64 only at the end (floats are dyadic rationals and
+    the offsets are integers, so the interpolation itself is lossless).
+    Every float64 fraction-of-span form loses the boundary's microsecond
+    offset once that offset is below half an ulp of the fraction: a
+    boundary one microsecond before t1 of a 1e11-second span sits at
+    fraction 1 - 1e-17, which rounds to exactly 1.0 even when taken from
+    the nearer endpoint, and a boundary at the segment *midpoint* sits
+    at fraction 0.5 from either endpoint, so a microsecond-wide window
+    astride the midpoint has both boundaries snap to the midpoint
+    height. When the endpoints are opposite extremes (e.g.
+    -sys.float_info.max -> +sys.float_info.max around T = 0) that
+    midpoint height is exactly zero, so the whole window misreads as
+    "on T" and its genuine above-T sliver — a positive height of
+    ~4e-17 on the common scale — cancels out of both above_seconds and
+    the degree-second area (midpoint cancellation). The exact form
+    keeps every offset: 0 yields exactly a0, span_us exactly a1, an
+    end-of-span microsecond keeps its proper value between the
+    baseline-adjacent floats (e.g. T one ulp below sys.float_info.max),
+    and a mid-span micro-window keeps its true tiny boundary heights,
+    on rising and falling segments alike.
 
     The scale is folded back in by multiplication *last*, after the tiny
     crossing ratio and the bounded scaled heights have already been
@@ -393,19 +405,26 @@ def _segment_above(
     # [-2, 2) can neither overflow nor underflow to a zero denominator.
     a0 = v0 / scale - baseline / scale
     a1 = v1 / scale - baseline / scale
-    slope = a1 - a0
+    # Exact rational copies of the scaled endpoint heights for the clip
+    # boundary interpolation (floats are dyadic rationals, so the copies
+    # are lossless).
+    q0, q1 = Fraction(a0), Fraction(a1)
 
     def height_at(off_us: int) -> float:
         # Affine interpolation of the scaled excess height at a clip
-        # boundary, evaluated from the nearer endpoint so the boundary's
-        # microsecond offset survives as a tiny fraction of the span
-        # (a "from the far endpoint" form rounds 1 - 1e-17 to 1.0 and
-        # loses it). Integer microsecond offsets keep the ratio exact
-        # relative to the whole span; an offset of 0 yields exactly a0
-        # and an offset of span_us exactly a1.
-        if off_us * 2 <= span_us:
-            return a0 + slope * (off_us / span_us)
-        return a1 - slope * ((span_us - off_us) / span_us)
+        # boundary, evaluated in exact rational arithmetic from the
+        # integer microsecond offset and correctly rounded to float64
+        # only at the end. Any float64 fraction-of-span evaluation
+        # (from either endpoint, or any 1 - f form) rounds the offset
+        # away once it is below half an ulp of the fraction — one
+        # microsecond at either end of a 1e11-second span, and every
+        # microsecond around the span's midpoint (fraction exactly 0.5)
+        # — snapping the boundary height to an endpoint or midpoint
+        # value and cancelling a genuine crossing sliver to zero. The
+        # exact form keeps the offset: 0 yields exactly a0, span_us
+        # exactly a1, and a mid-span micro-window keeps its true tiny
+        # boundary heights.
+        return float((q0 * (span_us - off_us) + q1 * off_us) / span_us)
 
     h_start = height_at(off_start_us)
     h_end = height_at(off_end_us)
@@ -466,18 +485,26 @@ def compute_heat_exposure(
     microsecond offsets within the segment's span (the resolution of the
     stored timestamps), and the boundary temperatures are evaluated
     inside the segment math as affine interpolations of the scaled
-    endpoint excess heights, taken from the *nearer* endpoint. A plain
-    fraction-of-span from t0 (or any ``1 - f`` form) rounds to exactly
-    1.0 in float64 for a boundary one microsecond before t1 of a
-    1e11-second span, silently snapping the boundary temperature to the
-    far endpoint; a slope form ``v0 + (v1 - v0) * fraction`` overflows to
-    +-inf whenever the endpoint difference exceeds the float range
-    (legitimate extremes such as -1e308 -> 1e308). The near-endpoint
-    affine form keeps the microsecond offset as a tiny nonzero fraction
-    of the span and stays finite for any finite endpoint temperatures,
-    so a microsecond-wide window at either end of a huge-span segment
-    keeps its true interpolated boundary temperature even when the
-    endpoints are the extreme finite floats and T sits one ulp away.
+    endpoint excess heights, computed in exact rational arithmetic from
+    the integer offsets and correctly rounded to float64 only at the
+    end. Every float64 fraction-of-span form (from either endpoint, or
+    any ``1 - f`` form) rounds the microsecond offset away once it is
+    below half an ulp of the fraction — one microsecond before t1 of a
+    1e11-second span snaps to exactly 1.0 and the boundary temperature
+    to the far endpoint, and a microsecond-wide window astride the
+    span's midpoint (fraction exactly 0.5 from both sides) has both
+    boundary heights snap to the midpoint height, which for opposite
+    extreme endpoints around T = 0 is exactly zero: the window's
+    above-T sliver then cancels out of both above_seconds and the
+    degree-second area. A slope form ``v0 + (v1 - v0) * fraction``
+    additionally overflows to +-inf whenever the endpoint difference
+    exceeds the float range (legitimate extremes such as
+    -1e308 -> 1e308). The exact rational form keeps every microsecond
+    offset and stays finite for any finite endpoint temperatures, so a
+    microsecond-wide window at either end — or in the middle — of a
+    huge-span segment keeps its true interpolated boundary temperature
+    even when the endpoints are the extreme finite floats and T sits
+    one ulp away, on rising and falling segments alike.
     The crossing ratio and the (temperature - T) area are likewise taken
     on one common power-of-two scale — the largest power of two not
     exceeding the largest magnitude of the two endpoints and T, taken
@@ -520,9 +547,9 @@ def compute_heat_exposure(
         # Exact integer microsecond offsets of the clip window within the
         # segment's span (timedelta arithmetic is exact at microsecond
         # resolution): the boundary temperatures are interpolated from
-        # these inside _segment_above, where the fraction is taken from
-        # the nearer endpoint so a microsecond offset from a segment end
-        # survives instead of rounding to exactly 0 or 1.
+        # these inside _segment_above in exact rational arithmetic, so a
+        # microsecond offset anywhere in the span — at either end or
+        # astride the midpoint — survives instead of rounding away.
         span_us = (t1 - t0) // microsecond
         off_start_us = (c_start - t0) // microsecond
         off_end_us = (c_end - t0) // microsecond
