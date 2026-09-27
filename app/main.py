@@ -1380,11 +1380,16 @@ def heat_exposure(
     extrapolated. Segments are clipped to [start, end] (a window boundary
     may be interpolated from the readings on either side of it) and split
     wherever the temperature crosses T. A clip boundary is interpolated
-    from the *nearer* segment endpoint at exact microsecond-offset
-    resolution, so a boundary one microsecond before the end of a huge
-    span (whose fraction of the span rounds to exactly 1.0 from the far
-    endpoint) keeps its true interpolated temperature instead of snapping
-    to the endpoint value. The crossing fraction and the
+    at exact microsecond-offset resolution in exact rational arithmetic
+    (rounded once to float64), so a boundary one microsecond before the
+    end of a huge span (whose fraction of the span rounds to exactly 1.0
+    from the far endpoint) keeps its true interpolated temperature
+    instead of snapping to the endpoint value, and a microsecond-wide
+    window at the midpoint of a huge span (whose offset ratio rounds to
+    exactly 0.5 from either endpoint, cancelling both boundary heights
+    to zero) keeps the tiny positive excess of its above-T part instead
+    of reporting zero above-time and zero area — for ascending and
+    descending segments alike. The crossing fraction and the
     (temperature - T) area are evaluated on one common power-of-two
     scale derived from the largest magnitude involved (the scale comes
     from frexp's binary exponent, so choosing it never overflows even

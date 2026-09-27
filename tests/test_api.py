@@ -933,6 +933,75 @@ def test_heat_exposure_last_microsecond_of_huge_span_keeps_boundary_offset(clien
     assert body["excess_degree_seconds"] == 0.0
 
 
+def test_heat_exposure_midpoint_microsecond_window_of_huge_span(client):
+    # M = 1e11 s with the two readings exactly that far apart
+    # (2026-01-01T00:00:00Z -> 5194-11-16T09:46:40Z): the negative/positive
+    # maximum finite floats, T = 0. The query window is the microsecond
+    # starting exactly at the segment's midpoint (3610-06-09T16:53:20Z is
+    # exactly t0 + span/2): its offsets are span/2 and span/2 + 1, and
+    # (span/2 + 1) / span rounds to exactly 0.5 in float64 from *either*
+    # endpoint, so both boundary heights cancel to exactly 0.0 and the
+    # float-ratio forms report above_seconds = 0 and excess = 0 for a
+    # window whose above-T part carries a positive excess. The exact
+    # boundary evaluation keeps the microsecond offset: the window starts
+    # exactly at the crossing (temperature == T, not above) and rises
+    # above it, so the whole microsecond counts and the triangle area is
+    # 0.5 * 1e-6 s * (2*max/1e11 per s * 1e-6 s) ~ 1.7976931349e285.
+    max_float = sys.float_info.max
+    set_thresholds(client)
+    set_sampling(client, max_interval=100000000000, grace=0)
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", -max_float),
+            ("5194-11-16T09:46:40+00:00", max_float),
+        ],
+    )
+    resp = get_heat(
+        client,
+        "3610-06-09T16:53:20+00:00",
+        "3610-06-09T16:53:20.000001+00:00",
+        0.0,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.000001
+    assert math.isfinite(body["excess_degree_seconds"])
+    assert body["excess_degree_seconds"] == pytest.approx(1.7976931349e285, rel=1e-9)
+
+    # The descending ramp (+max -> -max) follows the same rule: the
+    # microsecond just BEFORE the midpoint is entirely above T with the
+    # same area, while the microsecond starting at the midpoint is
+    # entirely at or below T.
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", max_float),
+            ("5194-11-16T09:46:40+00:00", -max_float),
+        ],
+    )
+    body = get_heat(
+        client,
+        "3610-06-09T16:53:19.999999+00:00",
+        "3610-06-09T16:53:20+00:00",
+        0.0,
+    ).json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.000001
+    assert body["excess_degree_seconds"] == pytest.approx(1.7976931349e285, rel=1e-9)
+
+    body = get_heat(
+        client,
+        "3610-06-09T16:53:20+00:00",
+        "3610-06-09T16:53:20.000001+00:00",
+        0.0,
+    ).json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.0
+    assert body["excess_degree_seconds"] == 0.0
+
+
 # ------------------------------------------------------------ freshness & UTC
 
 def test_heat_exposure_late_arrival_fills_gap(client):

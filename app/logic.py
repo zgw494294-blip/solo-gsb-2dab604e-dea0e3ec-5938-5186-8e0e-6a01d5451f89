@@ -18,6 +18,7 @@ from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from statistics import median
 from typing import Iterable, List, Optional, Tuple
 
@@ -356,18 +357,30 @@ def _segment_above(
         the smallest positive readings (e.g. 0 -> 5e-324, the minimum
         subnormal, at T = 0) interpolate instead of dividing by zero.
 
-    The clip-boundary heights are affine interpolations of the scaled
-    endpoint excess heights a0/a1, evaluated from the *nearer* endpoint:
-    a boundary one microsecond before t1 over a 1e11-second span sits at
-    fraction 1 - 1e-17 from t0, which rounds to exactly 1.0 in float64,
-    so a "from t0" evaluation (or any 1 - f form) loses the offset and
-    misreads the boundary temperature by a whole endpoint ulp. Taking the
-    fraction from the nearer endpoint keeps the microsecond offset as a
-    tiny but nonzero fraction of the span, so the boundary height keeps
-    its proper value between the baseline-adjacent floats (e.g. T one ulp
-    below sys.float_info.max) and the area of a microsecond-wide window
-    at the segment's end stays the true trapezoid instead of a
-    constant-endpoint rectangle.
+    The clip-boundary heights are the affine interpolation of the
+    scaled endpoint excess heights — the exact convex combination
+    ``(a0 * (span - offset) + a1 * offset) / span`` — evaluated in
+    exact rational arithmetic (the microsecond offset is an exact
+    integer, and the endpoint difference is taken unrounded rather than
+    as the float64 slope ``a1 - a0``, whose rounding would be carried
+    across the whole span and swamp a tiny height near the far
+    endpoint) and rounded once to float64. No float64 fraction of the
+    span can hold a one-microsecond offset once the span is huge: near
+    an endpoint a "from the far endpoint" form (or any ``1 - f`` form)
+    rounds 1 - 1e-17 to exactly 1.0 and snaps the boundary temperature
+    to the endpoint value, and mid-span ``(span/2 +/- 1) / span``
+    rounds to exactly 0.5 from *either* endpoint, so both boundary
+    heights cancel to exactly 0.0 and a microsecond-wide window
+    straddling the crossing loses its above-baseline part entirely
+    (zero above-time, zero area). The exact evaluation keeps the
+    microsecond offset anywhere in the span, so a microsecond-wide
+    window at either end of a 1e11-second segment keeps its true
+    interpolated boundary temperature (e.g. T one ulp below
+    sys.float_info.max) and one at the segment's midpoint keeps the
+    tiny positive excess of its above-T half (e.g. a -max -> +max ramp
+    around T = 0, and likewise the descending +max -> -max ramp)
+    instead of reporting zero. Offsets of 0 and span_us return the
+    endpoint heights a0 / a1 themselves.
 
     The scale is folded back in by multiplication *last*, after the tiny
     crossing ratio and the bounded scaled heights have already been
@@ -393,19 +406,35 @@ def _segment_above(
     # [-2, 2) can neither overflow nor underflow to a zero denominator.
     a0 = v0 / scale - baseline / scale
     a1 = v1 / scale - baseline / scale
-    slope = a1 - a0
+    a0_exact = Fraction(a0)
+    # Exact (unrounded) difference of the two endpoint heights: the
+    # interpolation must not go through the rounded float64 slope
+    # a1 - a0, whose rounding (up to half an ulp of the *endpoint*
+    # magnitudes) would be propagated across the whole span and swamp a
+    # tiny boundary height near the far endpoint (e.g. a0 ~ -4 rounds by
+    # 2**-52 while the true height one microsecond before t1 is ~2e-16).
+    da_exact = Fraction(a1) - a0_exact
 
     def height_at(off_us: int) -> float:
         # Affine interpolation of the scaled excess height at a clip
-        # boundary, evaluated from the nearer endpoint so the boundary's
-        # microsecond offset survives as a tiny fraction of the span
-        # (a "from the far endpoint" form rounds 1 - 1e-17 to 1.0 and
-        # loses it). Integer microsecond offsets keep the ratio exact
-        # relative to the whole span; an offset of 0 yields exactly a0
-        # and an offset of span_us exactly a1.
-        if off_us * 2 <= span_us:
-            return a0 + slope * (off_us / span_us)
-        return a1 - slope * ((span_us - off_us) / span_us)
+        # boundary — the exact convex combination
+        # (a0 * (span_us - off_us) + a1 * off_us) / span_us — evaluated
+        # in exact rational arithmetic and rounded once to float64: the
+        # integer microsecond offset keeps its exact value relative to
+        # the whole span, so the offset survives anywhere in the span —
+        # near an endpoint (where a "from the far endpoint" float form
+        # rounds 1 - 1e-17 to 1.0 and snaps the boundary temperature to
+        # the endpoint value) and equally mid-span (where
+        # (span/2 +/- 1) / span rounds to exactly 0.5 from either
+        # endpoint and both boundary heights cancel to exactly 0.0,
+        # hiding a microsecond-wide window that straddles the crossing).
+        # The endpoints themselves are returned as-is: an offset of 0
+        # yields exactly a0 and an offset of span_us exactly a1.
+        if off_us <= 0:
+            return a0
+        if off_us >= span_us:
+            return a1
+        return float(a0_exact + da_exact * off_us / span_us)
 
     h_start = height_at(off_start_us)
     h_end = height_at(off_end_us)
@@ -465,19 +494,25 @@ def compute_heat_exposure(
     Clip boundaries are passed to the segment math as exact integer
     microsecond offsets within the segment's span (the resolution of the
     stored timestamps), and the boundary temperatures are evaluated
-    inside the segment math as affine interpolations of the scaled
-    endpoint excess heights, taken from the *nearer* endpoint. A plain
-    fraction-of-span from t0 (or any ``1 - f`` form) rounds to exactly
-    1.0 in float64 for a boundary one microsecond before t1 of a
-    1e11-second span, silently snapping the boundary temperature to the
-    far endpoint; a slope form ``v0 + (v1 - v0) * fraction`` overflows to
-    +-inf whenever the endpoint difference exceeds the float range
-    (legitimate extremes such as -1e308 -> 1e308). The near-endpoint
-    affine form keeps the microsecond offset as a tiny nonzero fraction
-    of the span and stays finite for any finite endpoint temperatures,
-    so a microsecond-wide window at either end of a huge-span segment
-    keeps its true interpolated boundary temperature even when the
-    endpoints are the extreme finite floats and T sits one ulp away.
+    inside the segment math as the exact convex combination of the
+    scaled endpoint excess heights (the endpoint difference is taken
+    unrounded, not as the float64 slope) in exact rational arithmetic,
+    rounded once to float64. No float64 fraction of the span can hold a
+    one-microsecond offset once the span is huge: near an endpoint any
+    ``1 - f`` form rounds 1 - 1e-17 to exactly 1.0 and snaps the
+    boundary temperature to the far endpoint, while mid-span the offset
+    ratio rounds to exactly 0.5 from either endpoint and both boundary
+    heights cancel to exactly 0.0, so a microsecond-wide window
+    straddling the crossing of a -max -> +max ramp around T = 0 reports
+    zero above-time and zero area although its above-T part carries a
+    positive excess. The exact evaluation keeps the microsecond offset
+    anywhere in the span — ascending and descending segments alike — and
+    stays finite for any finite endpoint temperatures (a raw slope form
+    ``v0 + (v1 - v0) * fraction`` would overflow to +-inf for legitimate
+    extremes such as -1e308 -> 1e308), so a microsecond-wide window at
+    either end or at the midpoint of a huge-span segment keeps its true
+    interpolated boundary temperature even when the endpoints are the
+    extreme finite floats and T sits one ulp away.
     The crossing ratio and the (temperature - T) area are likewise taken
     on one common power-of-two scale — the largest power of two not
     exceeding the largest magnitude of the two endpoints and T, taken
