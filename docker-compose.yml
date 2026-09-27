@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/app.db
+    volumes:
+      - alarm-data:/data
+    restart: unless-stopped
+
+volumes:
+  alarm-data:
